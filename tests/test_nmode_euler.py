@@ -1,4 +1,4 @@
-"""Euler numerical checks and shared Euler/Rosenbrock network checks."""
+"""Euler numerical checks and shared network checks for all eight nmODE modes."""
 
 import io
 import math
@@ -11,14 +11,29 @@ import pytest
 import torch
 from torch import nn
 
-from nnunetv2.nets.nmODEs import NMODEEulerDecoderCell
+from nnunetv2.nets.nmODEs import (
+    NMODEEulerDecoderCell,
+    NMODERosenbrockDecoderCell,
+    NMODEHeunDecoderCell,
+    NMODERK4DecoderCell,
+    NMODEImplicitEulerDecoderCell,
+    NMODEImplicitMidpointDecoderCell,
+)
 from nnunetv2.nets.unet import PlainConvUNet
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 
-NMODE_MODES = [
-    "nmode_euler_learned", "nmode_euler_fixed",
-    "nmode_rosenbrock_learned", "nmode_rosenbrock_fixed",
-]
+NMODE_CELL_TYPES = {
+    "nmode_euler_learned": NMODEEulerDecoderCell,
+    "nmode_euler_fixed": NMODEEulerDecoderCell,
+    "nmode_rosenbrock_learned": NMODERosenbrockDecoderCell,
+    "nmode_rosenbrock_fixed": NMODERosenbrockDecoderCell,
+    "nmode_heun_learned": NMODEHeunDecoderCell,
+    "nmode_rk4_learned": NMODERK4DecoderCell,
+    "nmode_implicit_euler_learned": NMODEImplicitEulerDecoderCell,
+    "nmode_implicit_midpoint_learned": NMODEImplicitMidpointDecoderCell,
+}
+NMODE_MODES = list(NMODE_CELL_TYPES)
+LEARNED_MODES = [mode for mode in NMODE_MODES if mode.endswith("_learned")]
 
 
 def make_model(dim=2, mode="nmode_euler_learned", deep_supervision=False):
@@ -61,6 +76,7 @@ def test_zero_input_zero_state_and_single_stage():
 @pytest.mark.parametrize("mode", NMODE_MODES)
 def test_scale_allocation_and_parameter_overhead(mode):
     model = make_model(mode=mode)
+    assert all(type(stage) is NMODE_CELL_TYPES[mode] for stage in model.decoder.stages)
     steps = model.decoder.get_scale_steps()
     torch.testing.assert_close(steps, torch.full((3,), 1 / 3))
     assert steps.dtype == torch.float32
@@ -73,8 +89,11 @@ def test_scale_allocation_and_parameter_overhead(mode):
         steps = model.decoder.get_scale_steps()
         assert steps[0] < steps[1] < steps[2]
         torch.testing.assert_close(steps.sum(), torch.tensor(1.0))
-        fixed = make_model(mode=mode.replace("_learned", "_fixed"))
-        assert sum(p.numel() for p in model.parameters()) - sum(p.numel() for p in fixed.parameters()) == 3
+        reference = make_model(mode="nmode_rosenbrock_learned")
+        assert sum(p.numel() for p in model.parameters()) == sum(p.numel() for p in reference.parameters())
+        if mode in ("nmode_euler_learned", "nmode_rosenbrock_learned"):
+            fixed = make_model(mode=mode.replace("_learned", "_fixed"))
+            assert sum(p.numel() for p in model.parameters()) - sum(p.numel() for p in fixed.parameters()) == 3
     else:
         assert not steps.requires_grad
         assert not hasattr(model.decoder, "scale_logits")
@@ -168,7 +187,7 @@ def test_checkpoint_round_trip(mode):
     torch.testing.assert_close(restored.decoder.get_scale_steps(), model.decoder.get_scale_steps())
 
 
-@pytest.mark.parametrize("mode", ["nmode_euler_learned", "nmode_rosenbrock_learned"])
+@pytest.mark.parametrize("mode", LEARNED_MODES)
 def test_cpu_autocast_keeps_integration_fp32_and_gradients(mode):
     model = make_model(mode=mode)
     x = torch.randn(1, 1, 12, 16, requires_grad=True)
@@ -191,7 +210,7 @@ def test_cpu_autocast_keeps_integration_fp32_and_gradients(mode):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-@pytest.mark.parametrize("mode", ["nmode_euler_learned", "nmode_rosenbrock_learned"])
+@pytest.mark.parametrize("mode", LEARNED_MODES)
 def test_cuda_autocast_backward(mode):
     model = make_model(mode=mode).cuda()
     x = torch.randn(1, 1, 12, 16, device="cuda", requires_grad=True)
@@ -224,5 +243,5 @@ def test_existing_nmzoh_mode_keeps_its_parameter_structure():
     assert not hasattr(model.decoder, "scale_logits")
     assert all(hasattr(s, "log_A") for s in model.decoder.stages)
     assert model(torch.randn(1, 1, 12, 16)).shape == (1, 2, 12, 16)
-    with pytest.raises(ValueError, match="only for nmODE Euler"):
+    with pytest.raises(ValueError, match="only for single-step nmODE"):
         model.decoder.get_scale_steps()

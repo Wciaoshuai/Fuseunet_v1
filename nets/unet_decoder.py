@@ -19,6 +19,10 @@ from nnunetv2.nets.nmODEs import (
     NMZOHDecoderCell,
     NMODEEulerDecoderCell,
     NMODERosenbrockDecoderCell,
+    NMODEHeunDecoderCell,
+    NMODERK4DecoderCell,
+    NMODEImplicitEulerDecoderCell,
+    NMODEImplicitMidpointDecoderCell,
     MambaSelectiveDecoderCell,
     SelectiveZOHDecoderCell,
     FuseSSMZOHDecoderCell,
@@ -30,6 +34,17 @@ from nnunetv2.nets.nmODEs import (
     _raise_if_not_finite,
     get_hippo_diagonal,
 )
+
+NMODE_DECODER_CELLS = {
+    "nmode_euler_fixed": NMODEEulerDecoderCell,
+    "nmode_euler_learned": NMODEEulerDecoderCell,
+    "nmode_rosenbrock_fixed": NMODERosenbrockDecoderCell,
+    "nmode_rosenbrock_learned": NMODERosenbrockDecoderCell,
+    "nmode_heun_learned": NMODEHeunDecoderCell,
+    "nmode_rk4_learned": NMODERK4DecoderCell,
+    "nmode_implicit_euler_learned": NMODEImplicitEulerDecoderCell,
+    "nmode_implicit_midpoint_learned": NMODEImplicitMidpointDecoderCell,
+}
 
 init_scale = 2
     
@@ -162,18 +177,19 @@ class MyDecoder(nn.Module):
         self.discretization = discretization.lower()
         self.is_nmode_euler = self.discretization in ("nmode_euler_learned", "nmode_euler_fixed")
         self.is_nmode_rosenbrock = self.discretization in ("nmode_rosenbrock_learned", "nmode_rosenbrock_fixed")
-        self.is_nmode_single_step = self.is_nmode_euler or self.is_nmode_rosenbrock
+        self.is_nmode_single_step = self.discretization in NMODE_DECODER_CELLS
         if self.discretization not in ("multistep", "zoh", "s4d", "nmzoh", "mamba", "zoh_selective",
                                        "fusessm_zoh", "fusessm_zoh_approx",
                                        "ssm_multistep", "ssm_multistep_delta", "ssm_multistep_spatial", "mamba_multistep",
-                                       "vmunet_scan", "nmode_euler_learned", "nmode_euler_fixed",
-                                       "nmode_rosenbrock_learned", "nmode_rosenbrock_fixed"):
+                                       "vmunet_scan", *NMODE_DECODER_CELLS):
             raise ValueError(f"Unknown decoder discretization '{discretization}'. "
                              "Expected 'multistep', 'zoh', 's4d', 'nmzoh', 'mamba', 'zoh_selective', "
                              "'fusessm_zoh', 'fusessm_zoh_approx', "
                              "'ssm_multistep', 'ssm_multistep_delta', 'ssm_multistep_spatial', "
                              "'mamba_multistep', 'vmunet_scan', 'nmode_euler_learned', 'nmode_euler_fixed', "
-                             "'nmode_rosenbrock_learned' or 'nmode_rosenbrock_fixed'.")
+                             "'nmode_rosenbrock_learned', 'nmode_rosenbrock_fixed', 'nmode_heun_learned', "
+                             "'nmode_rk4_learned', 'nmode_implicit_euler_learned' or "
+                             "'nmode_implicit_midpoint_learned'.")
         n_stages_encoder = len(encoder.output_channels)
         if self.is_nmode_single_step and self.discretization.endswith("_learned"):
             self.scale_logits = nn.Parameter(torch.zeros(n_stages_encoder, dtype=torch.float32))
@@ -215,10 +231,8 @@ class MyDecoder(nn.Module):
                 up_upperlayer = upsamples[s]
             else: 
                 up_upperlayer=None
-            if self.is_nmode_euler:
-                stages.append(NMODEEulerDecoderCell(n_stages_encoder, s, upsamples[s-1]))
-            elif self.is_nmode_rosenbrock:
-                stages.append(NMODERosenbrockDecoderCell(n_stages_encoder, s, upsamples[s-1]))
+            if self.is_nmode_single_step:
+                stages.append(NMODE_DECODER_CELLS[self.discretization](n_stages_encoder, s, upsamples[s-1]))
             elif self.discretization == "zoh":
                 stages.append(ZOHDecoderCell(n_stages_encoder,
                                              s,
@@ -341,7 +355,7 @@ class MyDecoder(nn.Module):
         Rosenbrock's state-dependent effective weights are not these steps.
         """
         if not self.is_nmode_single_step:
-            raise ValueError("Scale steps are available only for nmODE Euler or Rosenbrock modes.")
+            raise ValueError("Scale steps are available only for single-step nmODE modes.")
         if self.discretization.endswith("_learned"):
             return torch.softmax(self.scale_logits.float(), dim=0)
         return torch.full(

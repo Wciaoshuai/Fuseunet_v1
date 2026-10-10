@@ -844,6 +844,113 @@ class NMODERosenbrockDecoderCell(nn.Module):
         return state, None
 
 
+def nmode_vector_field(state: torch.Tensor, drive: torch.Tensor) -> torch.Tensor:
+    """Original nmODE vector field; preserve dtype for numerical checks."""
+    return -state + torch.sin(state + drive).square()
+
+
+def nmode_state_jacobian(state: torch.Tensor, drive: torch.Tensor) -> torch.Tensor:
+    """Diagonal state Jacobian, including its dependence on state and drive."""
+    return -1 + torch.sin(2 * (state + drive))
+
+
+def nmode_heun_step(state: torch.Tensor, drive: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """Explicit trapezoidal/Heun update with a constant external drive."""
+    k1 = nmode_vector_field(state, drive)
+    k2 = nmode_vector_field(state + step * k1, drive)
+    return state + step * (k1 + k2) / 2
+
+
+def nmode_rk4_step(state: torch.Tensor, drive: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+    """Classical four-stage RK4 update with a constant external drive."""
+    k1 = nmode_vector_field(state, drive)
+    k2 = nmode_vector_field(state + step * k1 / 2, drive)
+    k3 = nmode_vector_field(state + step * k2 / 2, drive)
+    k4 = nmode_vector_field(state + step * k3, drive)
+    return state + step * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+
+def nmode_implicit_step(state: torch.Tensor, drive: torch.Tensor, step: torch.Tensor,
+                        *, midpoint: bool = False, iterations: int = 5) -> torch.Tensor:
+    """Solve backward Euler or implicit midpoint using full Newton updates.
+
+    Decoder cells always use five iterations, with no early stopping. The
+    iteration argument supports numerical checks of the one-Newton limit.
+    All operations retain their graph and input dtype; no clipping or detached
+    Jacobian is used. For nonnegative steps the residual derivative is >= 1.
+    """
+    if iterations < 1:
+        raise ValueError("Newton iterations must be positive.")
+    estimate = state
+    coefficient = 0.5 if midpoint else 1.0
+    for _ in range(iterations):
+        evaluation_state = (state + estimate) / 2 if midpoint else estimate
+        residual = estimate - state - step * nmode_vector_field(evaluation_state, drive)
+        derivative = 1 - coefficient * step * nmode_state_jacobian(evaluation_state, drive)
+        estimate = estimate - residual / derivative
+    return estimate
+
+
+class _NMODESingleStepDecoderCell(nn.Module):
+    """Shared projection and FP32 integration for the additional ablations."""
+
+    def __init__(self, num_stage: int, current_stage: int, opx: nn.Module):
+        super().__init__()
+        if num_stage < 1 or not 1 <= current_stage <= num_stage:
+            raise ValueError("Expected 1 <= current_stage <= num_stage.")
+        self.num_stage = num_stage
+        self.current_stage = current_stage
+        self.opx = opx
+        self.step = 1.0 / num_stage
+
+    def forward(self, f, x, y, step=None):
+        del f
+        # Project the selected scale once under the surrounding AMP policy.
+        drive = self.opx(x[-self.current_stage])
+        with torch.autocast(device_type=y.device.type, enabled=False):
+            state = y.float()
+            drive = drive.float()
+            delta = torch.as_tensor(
+                self.step if step is None else step,
+                dtype=torch.float32, device=y.device,
+            )
+            if delta.numel() != 1:
+                raise ValueError("An nmODE stage requires a scalar step.")
+            state = self._integrate(state, drive, delta)
+        return state, None
+
+    def _integrate(self, state, drive, step):
+        raise NotImplementedError
+
+
+class NMODEHeunDecoderCell(_NMODESingleStepDecoderCell):
+    """Second-order explicit Heun using the current scale's cached drive."""
+
+    def _integrate(self, state, drive, step):
+        return nmode_heun_step(state, drive, step)
+
+
+class NMODERK4DecoderCell(_NMODESingleStepDecoderCell):
+    """Classical RK4 using the current scale's cached drive in all four stages."""
+
+    def _integrate(self, state, drive, step):
+        return nmode_rk4_step(state, drive, step)
+
+
+class NMODEImplicitEulerDecoderCell(_NMODESingleStepDecoderCell):
+    """Backward Euler, unrolling five Newton corrections in train and eval."""
+
+    def _integrate(self, state, drive, step):
+        return nmode_implicit_step(state, drive, step, midpoint=False, iterations=5)
+
+
+class NMODEImplicitMidpointDecoderCell(_NMODESingleStepDecoderCell):
+    """Implicit midpoint, unrolling five Newton corrections in train and eval."""
+
+    def _integrate(self, state, drive, step):
+        return nmode_implicit_step(state, drive, step, midpoint=True, iterations=5)
+
+
 class NMZOHDecoderCell(nn.Module):
     """
     ZOH discretization of the original nmODE-style decoder:
